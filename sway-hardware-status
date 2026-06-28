@@ -1,0 +1,132 @@
+#!/usr/bin/env sh
+
+set -eu
+
+GPU_CARD="card1"
+
+cpu_usage() {
+    awk '
+    NR==1{
+        idle=$5+$6;
+        total=0;
+        for(i=2;i<=NF;i++) total+=$i;
+        print total, idle
+    }' /proc/stat
+}
+
+mem_usage() {
+    awk '
+    /MemTotal:/ {t=$2}
+    /MemAvailable:/ {a=$2}
+    END {printf "%d", (100*(t-a)/t)}' /proc/meminfo
+}
+
+swap_usage() {
+    awk '
+    /SwapTotal:/ {t=$2}
+    /SwapFree:/  {f=$2}
+    /SwapCached:/ {c=$2}
+    END {
+        used = (t - f - c);
+        if (t <= 0) {
+            print 0;
+        } else {
+            printf "%d", (100*used)/t;
+        }
+    }' /proc/meminfo
+}
+
+gpu_usage() {
+    rocm-smi --showuse --csv | awk -F',' 'NR==2 {gsub(/%/,"",$NF); print $NF}' 2>/dev/null || echo 0
+}
+
+gpu_temp_f() {
+    for f in /sys/class/drm/$GPU_CARD/device/hwmon/hwmon*/temp*_input; do
+        [ -r "$f" ] || continue
+        c=$(( $(cat "$f") / 1000 ))
+        echo $(( c * 9 / 5 + 32 ))
+        return
+    done
+    echo 0
+}
+
+color_cpu() {
+    [ "$1" -lt 50 ] && echo "#98c379" && return
+    [ "$1" -lt 80 ] && echo "#e5c07b" && return
+    echo "#e06c75"
+}
+
+color_mem() {
+    [ "$1" -lt 60 ] && echo "#98c379" && return
+    [ "$1" -lt 85 ] && echo "#e5c07b" && return
+    echo "#e06c75"
+}
+
+color_swap() {
+    [ "$1" -eq 0 ] && echo "#98c379" && return
+    [ "$1" -lt 50 ] && echo "#e5c07b" && return
+    echo "#e06c75"
+}
+
+color_gpu() {
+    [ "$1" -lt 50 ] && echo "#98c379" && return
+    [ "$1" -lt 80 ] && echo "#e5c07b" && return
+    echo "#e06c75"
+}
+
+color_temp() {
+    [ "$1" -lt 140 ] && echo "#98c379" && return
+    [ "$1" -lt 175 ] && echo "#e5c07b" && return
+    echo "#e06c75"
+}
+
+echo '{"version":1}'
+echo '['
+echo '[],'
+
+prev_total=0
+prev_idle=0
+
+while :; do
+    read -r total idle <<EOF
+$(cpu_usage)
+EOF
+
+    if [ "$prev_total" -eq 0 ]; then
+        prev_total=$total
+        prev_idle=$idle
+        sleep 1
+        continue
+    fi
+
+    dt=$((total - prev_total))
+    di=$((idle - prev_idle))
+
+    prev_total=$total
+    prev_idle=$idle
+
+    [ "$dt" -le 0 ] && cpu=0 || cpu=$((100 * (dt - di) / dt))
+
+    mem=$(mem_usage)
+    swap=$(swap_usage)
+    gpu=$(gpu_usage)
+    temp=$(gpu_temp_f)
+    time="$(date '+%H:%M:%S %Y-%m-%d')"
+
+    c_cpu=$(color_cpu "$cpu")
+    c_mem=$(color_mem "$mem")
+    c_swap=$(color_swap "$swap")
+    c_gpu=$(color_gpu "$gpu")
+    c_temp=$(color_temp "$temp")
+
+    echo "["
+    echo "{\"full_text\":\"CPU ${cpu}%\",\"color\":\"$c_cpu\"},"
+    echo "{\"full_text\":\" MEM ${mem}%\",\"color\":\"$c_mem\"},"
+    echo "{\"full_text\":\" SWAP ${swap}%\",\"color\":\"$c_swap\"},"
+    echo "{\"full_text\":\" GPU ${gpu}%\",\"color\":\"$c_gpu\"},"
+    echo "{\"full_text\":\" ${temp}°F\",\"color\":\"$c_temp\"},"
+    echo "{\"full_text\":\" $time\",\"color\":\"#abb2bf\"}"
+    echo "],"
+
+    sleep 1
+done
